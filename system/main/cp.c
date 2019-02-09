@@ -29,7 +29,8 @@ Mimics standard Unix commands.
 int main(int argc, char* argv[])
 {
     int i;
-    char *infile=NULL, *prog;
+    char *infile=NULL, *prog, *arg;
+    bool force = false, verb = false, inquire = false;
     sf_file in, out;
 
     sf_init (argc,argv);
@@ -37,35 +38,42 @@ int main(int argc, char* argv[])
     prog = sf_getprog();
 
     if (sf_stdin() && NULL != strstr (prog,"cp")) { 
-	/* cp with input file in stdin */
-	in = sf_input("in");
-	out = sf_output("out");
+      /* cp with input file in stdin */
+      in = sf_input("in");
+      out = sf_output("out");
     } else {
-	in = NULL;
-	out = NULL;
+      in = NULL;
+      out = NULL;
 
-	/* the first two non-parameters are in and out files */
-	for (i=1; i< argc; i++) {
-	    if (NULL == strchr(argv[i],'=')) {
-		if (NULL == in) {
-		    infile = argv[i];
-		    in = sf_input (infile);
-		} else {
-		    out = sf_output (argv[i]);
-		    break;
-		}
-	    }
-	}
+      /* the first two non-parameters are in and out files */
+      for (i=1; i< argc; i++) {
+        arg = argv[i];
+        if ('-' == arg[0]) { /* it is an option */
+          if (NULL != strchr(arg,'f')) force = true;
+          if (NULL != strchr(arg,'v')) verb = true;
+          if (NULL != strchr(arg,'i')) inquire = true;
+        } else {
+          if (NULL == strchr(argv[i],'=')) {
+            if (NULL == in) {
+              infile = argv[i];
+              in = sf_input (infile);
+            } else {
+              out = sf_output (argv[i]);
+              break;
+            }
+          }
+        }
+      }
 
-	if (NULL == in || NULL == out)
-	    sf_error ("not enough input");
+      if (NULL == in || NULL == out)
+        sf_error ("not enough input");
     }
 
     sf_setformat(out,sf_histstring(in,"data_format"));
 
     sf_cp(in,out);
     if (NULL != strstr (prog,"mv"))
-	sf_rm(infile,false,false,false);
+      sf_rm(infile,force,verb,inquire);
 
     exit (0);
 }
