@@ -173,6 +173,7 @@ def check_all(context):
     psp(context) #FDNSI
     sparse(context) #FDNSI
     pfft(context)
+    mdio(context) # FDNSI
 
 def identify_platform(context):
     global plat
@@ -1908,6 +1909,80 @@ def pfft(context):
         context.Result(context_failure)
         #need_pkg('pfft',fatal=False)
 
+pkg['mdio'] = {'ubuntu':'mdio-cpp (build from https://github.com/TGSAI/mdio-cpp)'}
+
+def mdio(context):
+    'Detect a prebuilt mdio-cpp installation (https://github.com/TGSAI/mdio-cpp)'
+    context.Message("checking for MDIO (mdio-cpp) ... ")
+
+    mdiohome  = context.env.get('MDIO_HOME', os.environ.get('MDIO_HOME'))
+
+    cpppath   = context.env.get('MDIO_CPPPATH',   os.environ.get('MDIO_CPPPATH'))
+    libpath   = context.env.get('MDIO_LIBPATH',   os.environ.get('MDIO_LIBPATH'))
+    libs      = context.env.get('MDIO_LIBS',      os.environ.get('MDIO_LIBS'))
+    linkflags = context.env.get('MDIO_LINKFLAGS', os.environ.get('MDIO_LINKFLAGS'))
+    cxxflags  = context.env.get('MDIO_CXXFLAGS',  os.environ.get('MDIO_CXXFLAGS'))
+
+    if cpppath and type(cpppath) is not list:
+        cpppath = cpppath.split(',')
+    if libpath and type(libpath) is not list:
+        libpath = libpath.split(',')
+    if libs and type(libs) is not list:
+        libs = libs.split(',')
+
+    if not cpppath:
+        cpppath = [os.path.join(mdiohome,'include'),mdiohome] if mdiohome else []
+    if not libpath:
+        libpath = [os.path.join(mdiohome,'lib'),
+                   os.path.join(mdiohome,'lib64')] if mdiohome else []
+    if not libs:
+        libs = ['mdio']
+
+    if not (mdiohome or cpppath):
+        context.Result(context_failure)
+        context.env['MDIO'] = None
+        return
+
+    oldpath     = path_get(context,'CPPPATH')
+    oldcxxflags = context.env.get('CXXFLAGS','')
+
+    context.env['CPPPATH'] = oldpath + cpppath
+    # mdio-cpp requires C++17 and the compile definitions captured at build
+    # time (notably -DMAX_NUM_SLICES, without which mdio.h fails to compile).
+    if cxxflags:
+        context.env['CXXFLAGS'] = oldcxxflags + ' ' + cxxflags
+    elif '-std=' not in oldcxxflags:
+        context.env['CXXFLAGS'] = oldcxxflags + ' -std=c++17'
+
+    text = '''
+    #include <mdio/mdio.h>
+    #include <string>
+    int main(int argc,char* argv[]) {
+    std::string p("demo.mdio");
+    auto ds = mdio::Dataset::Open(p, mdio::constants::kOpen);
+    (void) ds;
+    return 0;
+    }\n'''
+    res = context.TryCompile(text,'.cc')
+
+    context.env['CPPPATH'] = oldpath
+    context.env['CXXFLAGS'] = oldcxxflags
+
+    if res:
+        context.Result(res)
+        context.env['MDIO'] = True
+        context.env['MDIO_CPPPATH'] = cpppath
+        context.env['MDIO_LIBPATH'] = libpath
+        context.env['MDIO_LIBS'] = libs
+        if linkflags:
+            context.env['MDIO_LINKFLAGS'] = linkflags
+        if cxxflags:
+            context.env['MDIO_CXXFLAGS'] = cxxflags
+    else:
+        context.Result(context_failure)
+        context.env['MDIO'] = None
+        need_pkg('mdio', fatal=False)
+
 def ncpus():
     'Detects number of CPUs'
     if plat['OS'] in ('linux','posix'):
@@ -2681,5 +2756,12 @@ def options(file):
     opts.Add('NUMPY','Existence of numpy package')
     opts.Add('SWIG','Location of SWIG')
     opts.Add('PFFT','The PFFT library')
+    opts.Add('MDIO_HOME','Root of a prebuilt mdio-cpp installation')
+    opts.Add('MDIO','The mdio-cpp library (https://github.com/TGSAI/mdio-cpp)')
+    opts.Add('MDIO_CPPPATH','mdio-cpp - path(s) to headers')
+    opts.Add('MDIO_LIBPATH','mdio-cpp - path(s) to libraries')
+    opts.Add('MDIO_LIBS','mdio-cpp - libraries to link (mdio + internal deps)')
+    opts.Add('MDIO_LINKFLAGS','mdio-cpp - extra linker flags (e.g. archive group)')
+    opts.Add('MDIO_CXXFLAGS','mdio-cpp - extra C++ flags (std + compile defines)')
 
     return opts
