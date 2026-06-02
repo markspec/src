@@ -64,16 +64,20 @@ bool mdio_read_field(mdio::Dataset& ds, const std::string& name,
 bool mdio_coord(mdio::Dataset& ds, const std::string& label,
                 double* o, double* d);
 
-/* SEG-Y text (3200-byte EBCDIC) and binary (400-byte) headers stored in the
-   dataset-level metadata attributes.  Each returns false when absent. */
+/* SEG-Y text (3200-byte) and binary (400-byte) headers.  In the MDIO v1 layout
+   they live in the metadata (.zattrs "attributes") of the scalar
+   "segy_file_header" variable: textHeader (string) and binaryHeader (byte
+   array).  Each returns false when absent. */
 bool mdio_get_text_header(mdio::Dataset& ds, char ahead[SF_EBCBYTES]);
 bool mdio_get_binary_header(mdio::Dataset& ds, char bhead[SF_BNYBYTES]);
 
-/* Embed SEG-Y text/binary headers into a schema metadata object so they are
-   persisted with a newly created MDIO dataset. */
-void mdio_put_text_header(nlohmann::json& metadata,
+/* Embed SEG-Y text/binary headers into a new-dataset schema (the whole schema,
+   i.e. the object with "variables").  They are attached as attributes of the
+   v1 "segy_file_header" variable (created on first use), matching where the
+   Python mdio package stores them. */
+void mdio_put_text_header(nlohmann::json& schema,
                           const char ahead[SF_EBCBYTES]);
-void mdio_put_binary_header(nlohmann::json& metadata,
+void mdio_put_binary_header(nlohmann::json& schema,
                             const char bhead[SF_BNYBYTES]);
 
 /* Resolve the MDIO variable name that stores values for SEG-Y key "key",

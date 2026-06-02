@@ -303,7 +303,7 @@ int main(int argc, char* argv[])
             }
         }
     }
-    if (have_text) mdio_put_text_header(schema["metadata"], ahead);
+    if (have_text) mdio_put_text_header(schema, ahead);
 
     char bhead[SF_BNYBYTES];
     bool have_bin = false;
@@ -322,7 +322,7 @@ int main(int argc, char* argv[])
             }
         }
     }
-    if (have_bin) mdio_put_binary_header(schema["metadata"], bhead);
+    if (have_bin) mdio_put_binary_header(schema, bhead);
 
     if (verb) sf_warning("Creating MDIO \"%s\" (%ld samples x %ld traces)",
                          path, ns, ntr);

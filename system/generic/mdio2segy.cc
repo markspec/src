@@ -95,6 +95,21 @@ static bool has_empty_label(mdio::Dataset& ds, const std::string& name)
     return false;
 }
 
+/* True for a 1-D dimension coordinate (rank 1 whose single dimension label
+   equals the variable name, e.g. "inline" over dim "inline").  Such variables
+   hold axis values, not per-trace headers, so trace-header lookup must skip
+   them: in MDIO v1 the per-trace geometry lives in the structured "headers"
+   variable, while the same-named dimension coordinate only spans the axis. */
+static bool is_dim_coordinate(mdio::Dataset& ds, const std::string& name)
+{
+    auto vr = ds.variables.at(name);
+    if (!vr.status().ok()) return false;
+    auto dom = vr.value().dimensions();
+    if ((int) dom.rank() != 1) return false;
+    auto labels = dom.labels();
+    return std::string(labels[0]) == name;
+}
+
 std::string mdio_data_variable(mdio::Dataset& ds, const char* given)
 {
     if (given && *given) return std::string(given);
@@ -145,7 +160,9 @@ static std::string header_field_name(mdio::Dataset& ds, const char* key)
 {
     std::vector<std::string> cands = header_aliases(key);
     for (size_t i = 0; i < cands.size(); i++)
-        if (ds.variables.contains_key(cands[i])) return cands[i];
+        if (ds.variables.contains_key(cands[i]) &&
+            !is_dim_coordinate(ds, cands[i]))
+            return cands[i];
     return "";
 }
 
@@ -155,6 +172,7 @@ bool mdio_read_header_key(mdio::Dataset& ds, const std::string& path,
                           std::vector<double>& out)
 {
     /* Layout 1: one variable per SEG-Y field. */
+    
     std::string f = header_field_name(ds, key);
     if (!f.empty()) return mdio_read_field(ds, f, out);
 
@@ -213,11 +231,34 @@ std::vector<MdioAxis> mdio_axes(mdio::Dataset& ds, const std::string& datavar)
 }
 
 /* ------------------------------------------------------------------ */
-/* Text / binary SEG-Y headers in the dataset metadata                */
+/* Text / binary SEG-Y headers in the segy_file_header variable        */
 /* ------------------------------------------------------------------ */
+/* MDIO v1 stores the SEG-Y file headers as attributes of a scalar
+   "segy_file_header" variable.  mdio-cpp surfaces a variable's user attributes
+   through Variable::getMetadata() under metadata/attributes (the same place we
+   write them in mdio_put_*); we also tolerate the bare .zattrs layout the
+   Python mdio package uses (textHeader/binaryHeader at the top level). */
+static const char* SEGY_FILE_HEADER_VAR = "segy_file_header";
+
+static bool segy_file_header_meta(mdio::Dataset& ds, nlohmann::json& out)
+{
+    auto vr = ds.variables.at(SEGY_FILE_HEADER_VAR);
+    if (!vr.status().ok()) return false;
+    out = vr.value().getMetadata();
+    return true;
+}
+
 static const nlohmann::json* find_node(const nlohmann::json& meta,
                                         const char* name)
 {
+    /* mdio-cpp shape: { "metadata": { "attributes": { <name>: ... } } } */
+    if (meta.contains("metadata") && meta["metadata"].is_object()) {
+        const nlohmann::json& m = meta["metadata"];
+        if (m.contains("attributes") && m["attributes"].contains(name))
+            return &m["attributes"][name];
+        if (m.contains(name)) return &m[name];
+    }
+    /* bare .zattrs shape (Python mdio): { "attributes": {...} } or top level. */
     if (meta.contains("attributes") && meta["attributes"].contains(name))
         return &meta["attributes"][name];
     if (meta.contains(name)) return &meta[name];
@@ -226,13 +267,20 @@ static const nlohmann::json* find_node(const nlohmann::json& meta,
 
 bool mdio_get_text_header(mdio::Dataset& ds, char ahead[SF_EBCBYTES])
 {
-    const nlohmann::json& meta = ds.getMetadata();
+    nlohmann::json meta;
+    if (!segy_file_header_meta(ds, meta)) return false;
     const nlohmann::json* node = find_node(meta, "textHeader");
     if (NULL == node) return false;
 
     memset(ahead, ' ', SF_EBCBYTES);
     if (node->is_string()) {
-        std::string s = node->get<std::string>();
+        /* A single string; the Python mdio package joins the 40 cards with
+           newlines, so drop those to recover the flat 3200-byte text. */
+        std::string raw = node->get<std::string>();
+        std::string s;
+        s.reserve(raw.size());
+        for (size_t i = 0; i < raw.size(); i++)
+            if (raw[i] != '\n' && raw[i] != '\r') s.push_back(raw[i]);
         memcpy(ahead, s.data(), std::min((size_t) SF_EBCBYTES, s.size()));
     } else if (node->is_array()) {
         /* A list of (usually 40) 80-character cards. */
@@ -252,7 +300,8 @@ bool mdio_get_text_header(mdio::Dataset& ds, char ahead[SF_EBCBYTES])
 
 bool mdio_get_binary_header(mdio::Dataset& ds, char bhead[SF_BNYBYTES])
 {
-    const nlohmann::json& meta = ds.getMetadata();
+    nlohmann::json meta;
+    if (!segy_file_header_meta(ds, meta)) return false;
     const nlohmann::json* node = find_node(meta, "binaryHeader");
     if (NULL == node) return false;
 
@@ -269,20 +318,46 @@ bool mdio_get_binary_header(mdio::Dataset& ds, char bhead[SF_BNYBYTES])
     return true;
 }
 
-void mdio_put_text_header(nlohmann::json& metadata,
-                          const char ahead[SF_EBCBYTES])
+/* Return a mutable reference to the attributes object of the segy_file_header
+   variable in a new-dataset schema, creating the variable (a 1-element scalar
+   int32 over its own dimension) on first use. */
+static nlohmann::json& segy_file_header_attributes(nlohmann::json& schema)
 {
-    metadata["attributes"]["textHeader"] =
-        std::string(ahead, (size_t) SF_EBCBYTES);
+    if (!schema.contains("variables") || !schema["variables"].is_array())
+        schema["variables"] = nlohmann::json::array();
+
+    nlohmann::json& vars = schema["variables"];
+    for (size_t i = 0; i < vars.size(); i++)
+        if (vars[i].contains("name") && vars[i]["name"] == SEGY_FILE_HEADER_VAR)
+            return vars[i]["metadata"]["attributes"];
+
+    nlohmann::json v;
+    v["name"]     = SEGY_FILE_HEADER_VAR;
+    v["dataType"] = "int32";
+    nlohmann::json dim;
+    dim["name"] = SEGY_FILE_HEADER_VAR;
+    dim["size"] = 1;
+    v["dimensions"] = nlohmann::json::array({dim});
+    v["metadata"]["attributes"] = nlohmann::json::object();
+    vars.push_back(v);
+    return vars[vars.size() - 1]["metadata"]["attributes"];
 }
 
-void mdio_put_binary_header(nlohmann::json& metadata,
+void mdio_put_text_header(nlohmann::json& schema,
+                          const char ahead[SF_EBCBYTES])
+{
+    nlohmann::json& attrs = segy_file_header_attributes(schema);
+    attrs["textHeader"] = std::string(ahead, (size_t) SF_EBCBYTES);
+}
+
+void mdio_put_binary_header(nlohmann::json& schema,
                             const char bhead[SF_BNYBYTES])
 {
     nlohmann::json arr = nlohmann::json::array();
     for (int i = 0; i < SF_BNYBYTES; i++)
         arr.push_back((int) (unsigned char) bhead[i]);
-    metadata["attributes"]["binaryHeader"] = arr;
+    nlohmann::json& attrs = segy_file_header_attributes(schema);
+    attrs["binaryHeader"] = arr;
 }
 
 /* ------------------------------------------------------------------ */
