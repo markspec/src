@@ -1923,11 +1923,11 @@ def mdio(context):
     linkflags = context.env.get('MDIO_LINKFLAGS', os.environ.get('MDIO_LINKFLAGS'))
     cxxflags  = context.env.get('MDIO_CXXFLAGS',  os.environ.get('MDIO_CXXFLAGS'))
 
-    if cpppath and type(cpppath) is not list:
+    if cpppath and not isinstance(cpppath, list):
         cpppath = cpppath.split(',')
-    if libpath and type(libpath) is not list:
+    if libpath and not isinstance(libpath, list):
         libpath = libpath.split(',')
-    if libs and type(libs) is not list:
+    if libs and not isinstance(libs, list):
         libs = libs.split(',')
 
     if not cpppath:
