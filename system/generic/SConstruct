@@ -100,21 +100,23 @@ mdio_mains = Split('mdioread mdiowrite')
 if env.get('MDIO'):
     menv = env.Clone()
 
-    # mdio-cpp needs C++17 plus the compile definitions captured at build time
-    # (e.g. -DMAX_NUM_SLICES); MDIO_CXXFLAGS carries both.
+    # mdio-cpp needs C++17 plus -DMAX_NUM_SLICES (required by mdio/impl.h).
+    # MDIO_CXXFLAGS carries both when set explicitly; otherwise supply defaults.
     mdio_cxxflags = menv.get('MDIO_CXXFLAGS','')
-    if mdio_cxxflags:
-        menv.Append(CXXFLAGS=' '+mdio_cxxflags)
-    elif '-std=' not in menv.get('CXXFLAGS',''):
-        menv.Append(CXXFLAGS=' -std=c++17')
+    extra_flags = mdio_cxxflags
+    if '-std=' not in menv.get('CXXFLAGS','') and '-std=' not in extra_flags:
+        extra_flags = '-std=c++17 ' + extra_flags
+    if 'MAX_NUM_SLICES' not in menv.get('CXXFLAGS','') and 'MAX_NUM_SLICES' not in extra_flags:
+        extra_flags = extra_flags + ' -DMAX_NUM_SLICES=32'
+    menv.Append(CXXFLAGS=' '+extra_flags.strip())
 
     mdio_cpppath   = menv.get('MDIO_CPPPATH',[])
     mdio_libpath   = menv.get('MDIO_LIBPATH',[])
     mdio_libs      = menv.get('MDIO_LIBS',['mdio'])
     mdio_linkflags = menv.get('MDIO_LINKFLAGS','')
-    if type(mdio_cpppath) is not list: mdio_cpppath = mdio_cpppath.split(',')
-    if type(mdio_libpath) is not list: mdio_libpath = mdio_libpath.split(',')
-    if type(mdio_libs)    is not list: mdio_libs    = mdio_libs.split(',')
+    if not isinstance(mdio_cpppath, list): mdio_cpppath = mdio_cpppath.split(',')
+    if not isinstance(mdio_libpath, list): mdio_libpath = mdio_libpath.split(',')
+    if not isinstance(mdio_libs,    list): mdio_libs    = mdio_libs.split(',')
 
     # rsfsegy provides the SEG-Y key table and ebc2asc/asc2ebc helpers.
     menv.Prepend(LIBS=[dynlib+'rsfsegy', dynlib+'su'])

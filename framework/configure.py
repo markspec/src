@@ -1930,13 +1930,51 @@ def mdio(context):
     if libs and not isinstance(libs, list):
         libs = libs.split(',')
 
+    # mdio-cpp is a header-only interface library.  Its headers pull in
+    # tensorstore, absl, riegeli, protobuf, half, and nlohmann_json, all of
+    # which live only in the cmake build tree under _deps/.  Locate that tree
+    # via MDIO_BUILD_DIR or by heuristic from MDIO_HOME.
+    build_dir = context.env.get('MDIO_BUILD_DIR', os.environ.get('MDIO_BUILD_DIR'))
+    if not build_dir and mdiohome:
+        for candidate in [
+            os.path.join(os.path.dirname(mdiohome), 'src', 'mdio-cpp', 'build'),
+            os.path.join(os.path.dirname(mdiohome), 'mdio-cpp', 'build'),
+            os.path.join(mdiohome, '..', 'build'),
+        ]:
+            if os.path.isdir(os.path.join(os.path.normpath(candidate), '_deps')):
+                build_dir = os.path.normpath(candidate)
+                break
+
+    # Sub-dep header roots needed to compile mdio/mdio.h transitively
+    _dep_subdirs = [
+        ('tensorstore-src',                        ''),
+        ('absl-src',                               ''),
+        ('riegeli-src',                            ''),
+        ('protobuf-src',                           'src'),
+        ('half-src',                               'include'),
+        ('nlohmann_json-src',                      'include'),
+        ('nlohmann_json_schema_validator-src',      'src'),
+    ]
+    extra_inc = []
+    if build_dir:
+        deps_dir = os.path.join(build_dir, '_deps')
+        for dep, subdir in _dep_subdirs:
+            p = os.path.normpath(os.path.join(deps_dir, dep, subdir)) if subdir \
+                else os.path.join(deps_dir, dep)
+            if os.path.isdir(p):
+                extra_inc.append(p)
+
     if not cpppath:
         cpppath = [os.path.join(mdiohome,'include'),mdiohome] if mdiohome else []
+    for p in extra_inc:
+        if p not in cpppath:
+            cpppath.append(p)
     if not libpath:
         libpath = [os.path.join(mdiohome,'lib'),
                    os.path.join(mdiohome,'lib64')] if mdiohome else []
+    # mdio is header-only; the only real library to link is the json-schema validator
     if not libs:
-        libs = ['mdio']
+        libs = ['nlohmann_json_schema_validator']
 
     if not (mdiohome or cpppath):
         context.Result(context_failure)
@@ -1947,12 +1985,14 @@ def mdio(context):
     oldcxxflags = context.env.get('CXXFLAGS','')
 
     context.env['CPPPATH'] = oldpath + cpppath
-    # mdio-cpp requires C++17 and the compile definitions captured at build
-    # time (notably -DMAX_NUM_SLICES, without which mdio.h fails to compile).
-    if cxxflags:
-        context.env['CXXFLAGS'] = oldcxxflags + ' ' + cxxflags
-    elif '-std=' not in oldcxxflags:
-        context.env['CXXFLAGS'] = oldcxxflags + ' -std=c++17'
+    # mdio-cpp requires C++17 and -DMAX_NUM_SLICES (without which mdio/impl.h
+    # fails to compile).  Always ensure both are present.
+    extra_flags = cxxflags if cxxflags else ''
+    if '-std=' not in oldcxxflags and '-std=' not in extra_flags:
+        extra_flags = '-std=c++17 ' + extra_flags
+    if 'MAX_NUM_SLICES' not in oldcxxflags and 'MAX_NUM_SLICES' not in extra_flags:
+        extra_flags = extra_flags + ' -DMAX_NUM_SLICES=32'
+    context.env['CXXFLAGS'] = (oldcxxflags + ' ' + extra_flags).strip()
 
     text = '''
     #include <mdio/mdio.h>
@@ -1974,6 +2014,58 @@ def mdio(context):
         context.env['MDIO_CPPPATH'] = cpppath
         context.env['MDIO_LIBPATH'] = libpath
         context.env['MDIO_LIBS'] = libs
+
+        # Auto-generate MDIO_LINKFLAGS from the cmake build tree's link.txt.
+        # mdio is header-only but its transitive deps (tensorstore, absl, etc.)
+        # are static archives with circular dependencies; they must be wrapped in
+        # --start-group/--end-group and listed explicitly.
+        if not linkflags and build_dir:
+            _link_txt = None
+            for _candidate_test in ('mdio_s3_test', 'mdio_dataset_test',
+                                    'mdio_variable_test', 'mdio_acceptance_test'):
+                _p = os.path.join(build_dir, 'mdio', 'CMakeFiles',
+                                  _candidate_test + '.dir', 'link.txt')
+                if os.path.isfile(_p):
+                    _link_txt = _p
+                    break
+            if _link_txt:
+                try:
+                    # link.txt paths are relative to the cmake build dir for
+                    # the target's subdirectory (e.g. build/mdio/), which is
+                    # three levels above the link.txt file itself:
+                    #   build/mdio/CMakeFiles/<target>.dir/link.txt
+                    _link_base = os.path.dirname(
+                        os.path.dirname(os.path.dirname(_link_txt)))
+                    _tokens = open(_link_txt).read().split()
+                    _flags = []
+                    _skip = False
+                    for _tok in _tokens:
+                        if _skip:
+                            _skip = False
+                            continue
+                        if _tok in ('/usr/bin/c++', '/usr/bin/g++',
+                                    '/usr/bin/clang++', '-pthread'):
+                            continue
+                        if _tok == '-o':
+                            _skip = True
+                            continue
+                        if _tok.endswith('.o'):
+                            continue
+                        if _tok.endswith('.a') and not _tok.startswith('/'):
+                            _tok = os.path.normpath(
+                                os.path.join(_link_base, _tok))
+                        # skip test-only libs
+                        if any(x in _tok for x in ('gtest', 'gmock',
+                                                    'benchmark')):
+                            continue
+                        _flags.append(_tok)
+                    if _flags:
+                        linkflags = ('-Wl,--start-group ' +
+                                     ' '.join(_flags) +
+                                     ' -Wl,--end-group -pthread')
+                except Exception:
+                    pass
+
         if linkflags:
             context.env['MDIO_LINKFLAGS'] = linkflags
         if cxxflags:
