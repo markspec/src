@@ -16,7 +16,7 @@
 
 FROM ubuntu:26.04
 
-MAINTAINER "Sergey Fomel <sergey.fomel@gmail.com>"
+LABEL maintainer="Sergey Fomel <sergey.fomel@gmail.com>"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -94,16 +94,16 @@ RUN cmake -B /root/mdio-cpp/build \
 # mdio_s3_test:      S3 kvstore — needed for sfmdioread mdio=s3://... URIs.
 RUN cmake --build /root/mdio-cpp/build \
       --target mdio_dataset_test \
-      -j$(nproc)
+      -j"$(nproc)"
 
 RUN cmake --build /root/mdio-cpp/build \
       --target mdio_s3_test \
-      -j$(nproc)
+      -j"$(nproc)"
 
 # Build the JSON schema validator archive installed by cmake --install.
 RUN cmake --build /root/mdio-cpp/build \
       --target nlohmann_json_schema_validator \
-      -j$(nproc)
+      -j"$(nproc)"
 
 # Install mdio headers and libnlohmann_json_schema_validator.a.
 # The tensorstore .a archives remain in the build tree; configure.py reads
@@ -126,16 +126,16 @@ RUN sed -i "s/-Wall -pedantic/-Wall -pedantic -Wno-error=incompatible-pointer-ty
 # Configure and build Madagascar with MDIO support.
 # MDIO_HOME:      install prefix (headers + libnlohmann_json_schema_validator.a)
 # MDIO_BUILD_DIR: cmake build tree (configure.py reads link.txt from here)
-RUN cd /root/RSFSRC \
- && rm -f config.py \
+WORKDIR /root/RSFSRC
+RUN rm -f config.py \
  && ./configure \
-      --prefix=${RSFROOT} \
+      --prefix="${RSFROOT}" \
       MDIO_HOME=/root/mdio-cpp-install \
       MDIO_BUILD_DIR=/root/mdio-cpp/build \
  && make install
 
-RUN echo 'export RSFROOT="/root/RSFROOT"'                   >> $HOME/.bashrc \
- && echo 'source $RSFROOT/share/madagascar/etc/env.sh'      >> $HOME/.bashrc
+RUN echo 'export RSFROOT="/root/RSFROOT"'                   >> "$HOME/.bashrc" \
+ && echo 'source $RSFROOT/share/madagascar/etc/env.sh'      >> "$HOME/.bashrc"
 
 WORKDIR /root
 
