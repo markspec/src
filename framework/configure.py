@@ -2051,6 +2051,9 @@ def mdio(context):
                             continue
                         if _tok.endswith('.o'):
                             continue
+                        # cmake-internal flags that break out-of-tree linking
+                        if '--dependency-file' in _tok:
+                            continue
                         if _tok.endswith('.a') and not _tok.startswith('/'):
                             _tok = os.path.normpath(
                                 os.path.join(_link_base, _tok))
