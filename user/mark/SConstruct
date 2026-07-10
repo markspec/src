@@ -1,0 +1,45 @@
+import os
+import sys
+
+try:
+    Import('env root bindir pkgdir libdir incdir')
+    env = env.Clone()
+    global_build = True
+except:
+    env = Environment(ENV=os.environ)
+    root = None
+    bindir = pkgdir = None
+    global_build = False
+
+python = env.get('PYTHON', sys.executable)
+testenv = env.Clone(ENV=os.environ)
+
+if global_build:
+    binary = os.path.join(bindir, 'sfdask')
+    env.InstallAs(binary, 'Mdask.py')
+    env.AddPostAction(binary, Chmod(binary, 0o755))
+    env.RSF_Pycompile('Mdask.py')
+
+    docs = [env.Doc('dask', 'Mdask.py', lang='python')]
+    env.Depends(docs, '#/framework/rsf/doc.py')
+    doc = env.RSF_Docmerge('sfmark.py', docs)
+    env.Install(pkgdir, doc)
+
+# Dask is deliberately installed only by the explicit setup alias.  A normal
+# Madagascar build must not modify the active Python environment.
+setup = testenv.Command(
+    '.sfdask-setup',
+    'requirements-sfdask.txt',
+    '%s -m pip install -r $SOURCE && '
+    '%s -c "open(r\'$TARGET\', \'w\').write(\'ok\\n\')"' % (python, python),
+)
+testenv.Alias('setup', setup)
+
+test = testenv.Command(
+    'sfdask-test.log',
+    ['sfdask/test_sfdask.py', 'Mdask.py'],
+    '%s ${SOURCES[0]} ${SOURCES[1]} 2>&1 | tee $TARGET' % python,
+)
+testenv.Depends(test, setup)
+testenv.AlwaysBuild(test)
+testenv.Alias('test', test)

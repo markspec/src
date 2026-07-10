@@ -81,6 +81,50 @@ static bool write_int_var(mdio::Dataset& ds, const std::string& name,
     return var.Write(vd).status().ok();
 }
 
+template <typename T>
+static bool chunk_aligned(const mdio::Variable<T>& var,
+                          const std::vector<long>& first,
+                          const std::vector<long>& count,
+                          const std::vector<std::string>& labels,
+                          std::string& why)
+{
+    auto cr = var.get_chunk_shape();
+    if (!cr.status().ok()) {
+        why = "cannot determine chunk shape";
+        return false;
+    }
+    std::vector<mdio::DimensionIndex> chunks = cr.value();
+    auto dom = var.dimensions();
+    auto vlabels = dom.labels();
+    auto shape = dom.shape();
+    if (chunks.size() != vlabels.size()) {
+        why = "chunk rank does not match variable rank";
+        return false;
+    }
+
+    for (size_t v = 0; v < vlabels.size(); v++) {
+        int a = -1;
+        for (size_t i = 0; i < labels.size(); i++)
+            if (std::string(vlabels[v]) == labels[i]) { a = (int) i; break; }
+        if (a < 0) continue; /* e.g. a structured-header byte dimension */
+
+        long c = (long) chunks[v];
+        long begin = first[(size_t) a];
+        long end = begin + count[(size_t) a];
+        long extent = (long) shape[v];
+        if (c <= 0 || begin % c != 0 || (end != extent && end % c != 0)) {
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "axis %s region [%ld,%ld) is not aligned to chunk %ld"
+                     " (extent %ld)",
+                     labels[(size_t) a].c_str(), begin, end, c, extent);
+            why = msg;
+            return false;
+        }
+    }
+    return true;
+}
+
 int main(int argc, char* argv[])
 {
     sf_init(argc, argv);
@@ -99,6 +143,22 @@ int main(int argc, char* argv[])
     char* dataname = sf_getstring("data");
     /* name of the MDIO data variable (default "seismic") */
     std::string datavar = (NULL != dataname) ? dataname : "seismic";
+
+    char* modearg = sf_getstring("mode");
+    /* write mode: write (default/full replacement), init/create (create an
+       empty full-shape dataset), or patch/update (write one existing region) */
+    std::string mode = (NULL != modearg) ? modearg : "write";
+    bool init_alias = false, patch_alias = false;
+    sf_getbool("init", &init_alias);
+    sf_getbool("patch", &patch_alias);
+    if (init_alias) mode = "init";
+    if (patch_alias) mode = "patch";
+    bool initialize = (mode == "init" || mode == "create");
+    bool patch = (mode == "patch" || mode == "update");
+    if (!initialize && !patch && mode != "write")
+        sf_error("Unknown mode=%s (use write, init/create, or patch/update)",
+                 mode.c_str());
+    if (initialize && patch) sf_error("init and patch modes are mutually exclusive");
 
     /* header-copy source dataset */
     char* srcpath = sf_getstring("headers");
@@ -146,6 +206,23 @@ int main(int argc, char* argv[])
         if (un) { ax.unit = un; free(un); }
         ax.sample = (ri == 1);
         axes[a] = ax;
+    }
+
+    /* In init mode the input supplies axis metadata, while fulln# (or N#)
+       supplies the global extent.  Omitting it preserves the input extent. */
+    if (initialize) {
+        for (int ri = 1; ri <= dim; ri++) {
+            char key[16];
+            off_t full = n[ri - 1];
+            snprintf(key, sizeof(key), "fulln%d", ri);
+            bool supplied = sf_getlargeint(key, &full);
+            if (!supplied) {
+                snprintf(key, sizeof(key), "N%d", ri);
+                supplied = sf_getlargeint(key, &full);
+            }
+            if (full < 1) sf_error("Full extent for axis %d must be positive", ri);
+            axes[dim - ri].size = (long) full;
+        }
     }
 
     double o1 = axes[dim - 1].o;  /* sample-axis origin -> delrt */
@@ -231,6 +308,103 @@ int main(int argc, char* argv[])
             keynames.push_back("delrt");
             columns.push_back(col);
         }
+    }
+
+    /* ---- patch an existing dataset without changing its metadata ---- */
+    if (patch) {
+        auto of = mdio::Dataset::Open(std::string(path), mdio::constants::kOpen);
+        if (!of.status().ok())
+            sf_error("Cannot open MDIO \"%s\" for patching: %s", path,
+                     of.status().ToString().c_str());
+        mdio::Dataset ds = of.value();
+
+        auto dvr = ds.variables.get<mdio::dtypes::float32_t>(datavar);
+        if (!dvr.status().ok())
+            sf_error("No float32 data variable \"%s\" in \"%s\"",
+                     datavar.c_str(), path);
+        auto data = dvr.value();
+        auto dom = data.dimensions();
+        int dataset_dim = (int) dom.rank();
+        if (dim > dataset_dim)
+            sf_error("Input rank %d exceeds MDIO rank %d",
+                     dim, dataset_dim);
+
+        auto dlabels = dom.labels();
+        auto dshape = dom.shape();
+        std::vector<std::string> labels((size_t) dataset_dim);
+        std::vector<long> first((size_t) dataset_dim),
+                          count((size_t) dataset_dim);
+        for (int a = 0; a < dataset_dim; a++) {
+            int ri = dataset_dim - a;
+            char key[8];
+            off_t lv;
+            long ff = 0;
+            /* Madagascar filters commonly omit trailing singleton axes from
+               each partition's output history.  Treat those absent slow axes
+               as length one so they can still patch a higher-rank dataset. */
+            long input_extent = (ri <= dim) ? (long) n[ri - 1] : 1L;
+            long nn = input_extent;
+            snprintf(key, sizeof(key), "f%d", ri);
+            if (sf_getlargeint(key, &lv)) ff = (long) lv;
+            snprintf(key, sizeof(key), "n%d", ri);
+            if (sf_getlargeint(key, &lv)) nn = (long) lv;
+            if (nn != input_extent)
+                sf_error("Patch n%d=%ld must equal input axis length %ld",
+                         ri, nn, input_extent);
+            if (ff < 0 || nn < 1 || ff + nn > (long) dshape[a])
+                sf_error("Patch axis %d region [%ld,%ld) exceeds MDIO extent %ld",
+                         ri, ff, ff + nn, (long) dshape[a]);
+            labels[(size_t) a] = std::string(dlabels[a]);
+            first[(size_t) a] = ff;
+            count[(size_t) a] = nn;
+        }
+
+        std::string why;
+        if (!chunk_aligned(data, first, count, labels, why))
+            sf_error("Unsafe data patch: %s; patches must own complete chunks",
+                     why.c_str());
+
+        std::vector<mdio::RangeDescriptor<mdio::Index> > slices;
+        for (int a = 0; a < dataset_dim; a++) {
+            mdio::RangeDescriptor<mdio::Index> r = {
+                labels[(size_t) a].c_str(),
+                (mdio::Index) first[(size_t) a],
+                (mdio::Index)(first[(size_t) a] + count[(size_t) a]), 1};
+            slices.push_back(r);
+        }
+        auto sr = ds.isel(slices);
+        if (!sr.status().ok())
+            sf_error("Failed to select patch region: %s",
+                     sr.status().ToString().c_str());
+        mdio::Dataset region = sr.value();
+
+        float* buf = sf_floatalloc(total);
+        sf_floatread(buf, total, in);
+        if (!write_float_buf(region, datavar, buf, total))
+            sf_error("Failed to patch data variable \"%s\"", datavar.c_str());
+        free(buf);
+
+        /* Optional tfile patches are supported for the separate int32 header
+           variables produced by this writer.  Each header region is checked
+           against that variable's own chunk grid before it is touched. */
+        for (size_t i = 0; i < keynames.size(); i++) {
+            auto hvr = ds.variables.get<mdio::dtypes::int32_t>(keynames[i]);
+            if (!hvr.status().ok()) {
+                if (verb) sf_warning("Skipping absent header variable \"%s\"",
+                                     keynames[i].c_str());
+                continue;
+            }
+            std::string hwhy;
+            if (!chunk_aligned(hvr.value(), first, count, labels, hwhy))
+                sf_error("Unsafe tfile patch for \"%s\": %s",
+                         keynames[i].c_str(), hwhy.c_str());
+            if (!write_int_var(region, keynames[i], columns[i]))
+                sf_error("Failed to patch header variable \"%s\"",
+                         keynames[i].c_str());
+        }
+
+        if (verb) sf_warning("Patched MDIO \"%s\"", path);
+        exit(0);
     }
 
     /* ---- chunking strategy / sizes ---- */
@@ -324,8 +498,9 @@ int main(int argc, char* argv[])
     }
     if (have_bin) mdio_put_binary_header(schema, bhead);
 
-    if (verb) sf_warning("Creating MDIO \"%s\" (%ld samples x %ld traces)",
-                         path, ns, ntr);
+    if (verb)
+        sf_warning("Creating MDIO \"%s\"%s",
+                   path, initialize ? " (empty initialization)" : "");
 
     auto dsFut = mdio::Dataset::from_json(schema, std::string(path),
                                           mdio::constants::kCreate);
@@ -350,19 +525,26 @@ int main(int argc, char* argv[])
     }
 
     /* ---- write data (RSF order matches MDIO row-major order) ---- */
-    {
+    if (!initialize) {
         float* buf = sf_floatalloc(total);
         sf_floatread(buf, total, in);
         if (!write_float_buf(ds, datavar, buf, total))
             sf_error("Failed to write data variable \"%s\"", datavar.c_str());
         free(buf);
+    } else {
+        /* An RSF input may be backed by a data-server pipe.  Init intentionally
+           consumes no samples, so close it explicitly instead of leaving the
+           producer waiting for a reader at process shutdown. */
+        sf_fileclose(in);
     }
 
     /* ---- write trace-header variables ---- */
-    for (size_t i = 0; i < keynames.size(); i++) {
-        if (!write_int_var(ds, keynames[i], columns[i]) && verb)
-            sf_warning("Could not write header variable \"%s\"",
-                       keynames[i].c_str());
+    if (!initialize) {
+        for (size_t i = 0; i < keynames.size(); i++) {
+            if (!write_int_var(ds, keynames[i], columns[i]) && verb)
+                sf_warning("Could not write header variable \"%s\"",
+                           keynames[i].c_str());
+        }
     }
 
     if (verb) sf_warning("Done");

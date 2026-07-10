@@ -63,10 +63,15 @@ RUN apt-get update && apt-get install -y \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
-# install python packages
+# Install Python packages. dask[distributed] provides the scheduler and Client
+# used by sfdask for local and external-cluster execution.
 # setuptools is required because Python 3.12+ removed the 'distutils' module
 # from the standard library; Madagascar's SCons scripts import distutils.sysconfig
-RUN pip install --break-system-packages numpy scipy setuptools
+RUN pip install --break-system-packages \
+        numpy \
+        scipy \
+        setuptools \
+        "dask[distributed]"
 
 # Build mdio-cpp (header-only library, but tensorstore static archives must
 # be compiled before Madagascar can link against them).
